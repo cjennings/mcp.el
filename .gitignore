@@ -1,3 +1,16 @@
 *.elc
+*.eln
 mcp-pkg.el
 mcp-autoloads.el
+mcp.el-autoloads.el
+
+# Eask / test infrastructure
+/.eask/
+/.coverage/
+/makefile-local
+/tests/makefile-local
+/tests/*-output.log
+/tests/tests-autoloads.el
+
+# Claude Code per-project tooling
+.ai/
