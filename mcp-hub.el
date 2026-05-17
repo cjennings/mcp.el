@@ -216,47 +216,52 @@ Returns a list of server statuses, where each status is a plist containing:
                 (list :name name :status 'stop))))
           mcp-hub-servers))
 
+(defun mcp-hub--build-tabulated-entries (server-list)
+  "Build `tabulated-list-entries' from SERVER-LIST.
+SERVER-LIST is the output of `mcp-hub-get-servers' — a list of server
+status plists.  Each returned element is (ID VECTOR) where ID is the
+1-based row index as a string and VECTOR holds the column strings:
+name, type, status, tool count, resource count, template-resource
+count, prompt count.
+
+Counts are the formatted string \"nil\" when the server is not
+connected.  Status is propertized with `success' / `error' faces for
+the connected and error states."
+  (cl-mapcar
+   (lambda (server index)
+     (let* ((name (plist-get server :name))
+            (status (plist-get server :status))
+            (type-cell (symbol-name (plist-get server :type)))
+            (status-cell (pcase status
+                           ('connected
+                            (propertize (symbol-name status) 'face 'success))
+                           ('error
+                            (propertize (symbol-name status) 'face 'error))
+                           (_
+                            (symbol-name status))))
+            (count-cells (if (equal status 'connected)
+                             (mapcar (lambda (x) (format "%d" (length x)))
+                                     (list (plist-get server :tools)
+                                           (plist-get server :resources)
+                                           (plist-get server :template-resources)
+                                           (plist-get server :prompts)))
+                           (list "nil" "nil" "nil" "nil")))
+            (row (append (list name type-cell status-cell) count-cells)))
+       (list (format "%d" index) (vconcat row))))
+   server-list
+   (number-sequence 1 (length server-list))))
+
 (defun mcp-hub-update (&optional ignore-auto noconfirm)
   "Update the MCP Hub display with current server status.
-If called interactively, ARG is the prefix argument.
-When SILENT is non-nil, suppress any status messages.
 This function refreshes the *Mcp-Hub* buffer with the latest server information,
 including connection status, available tools, resources, template resources and
 prompts."
   (interactive)
   (ignore ignore-auto noconfirm) ; unused variables
   (when-let* ((server-list (mcp-hub-get-servers))
-              (server-show (mapcar (lambda (server)
-                                     (let* ((name (plist-get server :name))
-                                            (status (plist-get server :status)))
-                                       (append (list name
-                                                     (symbol-name (plist-get server :type))
-                                                     (pcase status
-                                                       ('connected
-                                                        (propertize (symbol-name status)
-                                                                    'face 'success))
-                                                       ('error
-                                                        (propertize (symbol-name status)
-                                                                    'face 'error))
-                                                       (_
-                                                        (symbol-name status))))
-                                               (if (equal status 'connected)
-                                                   (mapcar (lambda (x)
-                                                             (format "%d"
-                                                                     (length x)))
-                                                           (list (plist-get server :tools)
-                                                                 (plist-get server :resources)
-                                                                 (plist-get server :template-resources)
-                                                                 (plist-get server :prompts)))
-                                                 (list "nil" "nil" "nil" "nil")))))
-                                   server-list)))
+              (entries (mcp-hub--build-tabulated-entries server-list)))
     (with-current-buffer (get-buffer-create "*Mcp-Hub*")
-      (setq tabulated-list-entries
-            (cl-mapcar (lambda (statu index)
-                         (list (format "%d" index)
-                               (vconcat statu)))
-                       server-show
-                       (number-sequence 1 (length server-list))))
+      (setq tabulated-list-entries entries)
       (tabulated-list-print t))))
 
 ;;;###autoload
@@ -461,104 +466,133 @@ Prompts for selection from the server's current roots."
 
   (define-key mcp-hub-detail-mode-map (kbd "g") #'mcp-hub-detail-refresh))
 
+(defun mcp-hub--build-detail-sections (connection running-p)
+  "Build the list of data sections for the detail view of CONNECTION.
+
+CONNECTION is an `mcp-process-connection' (or subclass).  RUNNING-P is t
+when the server is currently running, nil otherwise.
+
+Returns a list of section plists, each of the form
+\(list :kind KIND ...).  KIND is one of `status', `server-info',
+`tools', `resources', `template-resources', `prompts', or `roots'.
+Sections for absent data (e.g. no tools listed) are omitted, except for
+`status' which is always present.
+
+The renderer in `mcp-hub-detail--render' consumes this list and decides
+on faces / inserts buffer text per kind."
+  (let (sections)
+    (push (list :kind 'status
+                :running running-p
+                :connection-type (mcp--connection-type connection))
+          sections)
+    (when-let* ((server-info (mcp--server-info connection)))
+      (push (list :kind 'server-info :info server-info) sections))
+    (when-let* ((tools (mcp--tools connection)))
+      (push (list :kind 'tools :items tools) sections))
+    (when-let* ((resources (mcp--resources connection)))
+      (push (list :kind 'resources :items resources) sections))
+    (when-let* ((templates (mcp--template-resources connection)))
+      (push (list :kind 'template-resources :items templates) sections))
+    (when-let* ((prompts (mcp--prompts connection)))
+      (push (list :kind 'prompts :items prompts) sections))
+    (when-let* ((roots (mcp--roots connection)))
+      (push (list :kind 'roots :items roots) sections))
+    (nreverse sections)))
+
 (defun mcp-hub-detail--render (name connection)
   "Render detail content for server NAME with CONNECTION."
   (let ((inhibit-read-only t))
     (erase-buffer)
-
     ;; Server header
     (insert (propertize (format "%s\n" name)
                         'face '(font-lock-keyword-face (:height 2.0 :weight bold))
                         'mcp-server-name name))
     (insert (make-string (length (format "Server: %s" name)) ?-) "\n\n")
-
-    ;; Server status
-    (insert (propertize "Status:\n" 'face 'outline-1))
-    (insert (format "  Running: %s\n" (if (mcp--server-running-p name) "Yes" "No")))
-    (insert (format "  Connection type: %s\n" (mcp--connection-type connection)))
-    (insert "\n")
-
-    ;; Server info
-    (when-let* ((server-info (mcp--server-info connection)))
-      (insert (propertize "Server Information:\n" 'face 'outline-1))
-      (insert (format "  Name: %s\n" (or (plist-get server-info :name) "Unknown")))
-      (insert (format "  Version: %s\n" (or (plist-get server-info :version) "Unknown")))
-      (when-let* ((description (plist-get server-info :description)))
-        (insert (format "  Description: %s\n" description)))
-      (insert "\n"))
-
-    ;; Tools
-    (when-let* ((tools (mcp--tools connection)))
-      (insert (propertize (format "Tools (%d):\n" (length tools)) 'face 'outline-1))
-      (cl-loop for i from 0 below (length tools)
-               for tool = (aref tools i)
-               do (let ((tool-name (plist-get tool :name))
-                        (description (plist-get tool :description)))
-                    (insert (propertize (format "  • %s" tool-name) 'face 'outline-2))
-                    (insert "\n")
-                    (when description
-                      (insert (format "    %s\n" description)))))
-      (insert "\n"))
-
-    ;; Resources
-    (when-let* ((resources (mcp--resources connection)))
-      (insert (propertize (format "Resources (%d):\n" (length resources)) 'face 'outline-1))
-      (cl-loop for i from 0 below (length resources)
-               for resource = (if (vectorp resources) (aref resources i) (nth i resources))
-               do (let ((uri (plist-get resource :uri))
-                        (name (plist-get resource :name))
-                        (description (plist-get resource :description)))
-                    (insert (propertize (format "  • %s" name) 'face 'outline-2 'resource-uri uri))
-                    (when uri
-                      (insert (format " (%s)" (propertize uri 'face 'font-lock-string-face 'resource-uri uri))))
-                    (insert "\n")
-                    (when description
-                      (insert (format "    %s\n" description)))))
-      (insert "\n"))
-
-    ;; Template Resources
-    (when-let* ((templates (mcp--template-resources connection)))
-      (insert (propertize (format "Resource Templates (%d):\n" (length templates)) 'face 'outline-1))
-      (cl-loop for i from 0 below (length templates)
-               for template = (if (vectorp templates) (aref templates i) (nth i templates))
-               do (let ((uri-template (plist-get template :uriTemplate))
-                        (name (plist-get template :name))
-                        (description (plist-get template :description)))
-                    (insert (propertize (format "  • %s" name) 'face 'outline-2))
-                    (when uri-template
-                      (insert (format " (%s)" (propertize uri-template 'face 'font-lock-string-face))))
-                    (insert "\n")
-                    (when description
-                      (insert (format "    %s" description)))
-                    (insert "\n")))
-      (insert "\n"))
-
-    ;; Prompts
-    (when-let* ((prompts (mcp--prompts connection)))
-      (insert (propertize (format "Prompts (%d):\n" (length prompts)) 'face 'outline-1))
-      (cl-loop for i from 0 below (length prompts)
-               for prompt = (if (vectorp prompts) (aref prompts i) (nth i prompts))
-               do (let ((name (plist-get prompt :name))
-                        (description (plist-get prompt :description)))
-                    (message "Prompts: %s" prompt)
-                    (insert (propertize (format "  • %s" name) 'face 'outline-2))
-                    (insert "\n")
-                    (when description
-                      (insert (format "    %s" description)))
-                    (insert "\n")))
-      (insert "\n"))
-
-    ;; Roots
-    (when-let* ((roots (mcp--roots connection)))
-      (insert (propertize (format "Roots (%d):\n" (length roots)) 'face 'outline-1))
-      (cl-loop for i from 0 below (length roots)
-               for root = (if (vectorp roots) (aref roots i) (nth i roots))
-               do (if (stringp root)
-                      (insert (propertize (format "  • %s" root) 'face 'outline-2))
-                    (insert (propertize (format "  • %s" (plist-get root :name)) 'face 'font-lock-variable-name-face))
-                    (insert (format " (%s)" (propertize (plist-get root :uri) 'face 'font-lock-string-face))))
-               (insert "\n")))
-
+    ;; Data sections
+    (dolist (section (mcp-hub--build-detail-sections
+                      connection (mcp--server-running-p name)))
+      (pcase (plist-get section :kind)
+        ('status
+         (insert (propertize "Status:\n" 'face 'outline-1))
+         (insert (format "  Running: %s\n"
+                         (if (plist-get section :running) "Yes" "No")))
+         (insert (format "  Connection type: %s\n"
+                         (plist-get section :connection-type)))
+         (insert "\n"))
+        ('server-info
+         (let ((info (plist-get section :info)))
+           (insert (propertize "Server Information:\n" 'face 'outline-1))
+           (insert (format "  Name: %s\n" (or (plist-get info :name) "Unknown")))
+           (insert (format "  Version: %s\n" (or (plist-get info :version) "Unknown")))
+           (when-let* ((description (plist-get info :description)))
+             (insert (format "  Description: %s\n" description)))
+           (insert "\n")))
+        ('tools
+         (let ((tools (plist-get section :items)))
+           (insert (propertize (format "Tools (%d):\n" (length tools)) 'face 'outline-1))
+           (cl-loop for i from 0 below (length tools)
+                    for tool = (aref tools i)
+                    do (let ((tool-name (plist-get tool :name))
+                             (description (plist-get tool :description)))
+                         (insert (propertize (format "  • %s" tool-name) 'face 'outline-2))
+                         (insert "\n")
+                         (when description
+                           (insert (format "    %s\n" description)))))
+           (insert "\n")))
+        ('resources
+         (let ((resources (plist-get section :items)))
+           (insert (propertize (format "Resources (%d):\n" (length resources)) 'face 'outline-1))
+           (cl-loop for i from 0 below (length resources)
+                    for resource = (if (vectorp resources) (aref resources i) (nth i resources))
+                    do (let ((uri (plist-get resource :uri))
+                             (resource-name (plist-get resource :name))
+                             (description (plist-get resource :description)))
+                         (insert (propertize (format "  • %s" resource-name) 'face 'outline-2 'resource-uri uri))
+                         (when uri
+                           (insert (format " (%s)" (propertize uri 'face 'font-lock-string-face 'resource-uri uri))))
+                         (insert "\n")
+                         (when description
+                           (insert (format "    %s\n" description)))))
+           (insert "\n")))
+        ('template-resources
+         (let ((templates (plist-get section :items)))
+           (insert (propertize (format "Resource Templates (%d):\n" (length templates)) 'face 'outline-1))
+           (cl-loop for i from 0 below (length templates)
+                    for template = (if (vectorp templates) (aref templates i) (nth i templates))
+                    do (let ((uri-template (plist-get template :uriTemplate))
+                             (template-name (plist-get template :name))
+                             (description (plist-get template :description)))
+                         (insert (propertize (format "  • %s" template-name) 'face 'outline-2))
+                         (when uri-template
+                           (insert (format " (%s)" (propertize uri-template 'face 'font-lock-string-face))))
+                         (insert "\n")
+                         (when description
+                           (insert (format "    %s" description)))
+                         (insert "\n")))
+           (insert "\n")))
+        ('prompts
+         (let ((prompts (plist-get section :items)))
+           (insert (propertize (format "Prompts (%d):\n" (length prompts)) 'face 'outline-1))
+           (cl-loop for i from 0 below (length prompts)
+                    for prompt = (if (vectorp prompts) (aref prompts i) (nth i prompts))
+                    do (let ((prompt-name (plist-get prompt :name))
+                             (description (plist-get prompt :description)))
+                         (insert (propertize (format "  • %s" prompt-name) 'face 'outline-2))
+                         (insert "\n")
+                         (when description
+                           (insert (format "    %s" description)))
+                         (insert "\n")))
+           (insert "\n")))
+        ('roots
+         (let ((roots (plist-get section :items)))
+           (insert (propertize (format "Roots (%d):\n" (length roots)) 'face 'outline-1))
+           (cl-loop for i from 0 below (length roots)
+                    for root = (if (vectorp roots) (aref roots i) (nth i roots))
+                    do (if (stringp root)
+                           (insert (propertize (format "  • %s" root) 'face 'outline-2))
+                         (insert (propertize (format "  • %s" (plist-get root :name)) 'face 'font-lock-variable-name-face))
+                         (insert (format " (%s)" (propertize (plist-get root :uri) 'face 'font-lock-string-face))))
+                    (insert "\n"))))))
     (goto-char (point-min))))
 
 ;;;###autoload
@@ -618,6 +652,40 @@ server name, then fetch and display the resource content."
       (error
        (message "Failed to read resource %s: %s" uri (error-message-string err))))))
 
+(defun mcp-hub--prep-resource-text (result)
+  "Build display text for a `resources/read' RESULT.
+
+Per the MCP spec, RESULT contains :contents, an array of content objects
+with optional :mimeType, :text, and :blob fields.  When :contents is a
+single object rather than a vector, it is wrapped to a single-element
+vector and then handled the same way.
+
+For each content object:
+- A text part with a non-text MIME type is prefixed with `[MIME: …]'.
+- A blob part is summarized as `[Binary: MIME, base64 N bytes]'.
+- Anything else falls through to `prin1-to-string'.
+
+Multiple parts are joined with `\\n---\\n'.  Returns the single composed
+display string."
+  (let* ((contents (plist-get result :contents))
+         (parts (if (vectorp contents) contents (vector contents))))
+    (mapconcat
+     (lambda (item)
+       (let ((mime (plist-get item :mimeType))
+             (text-content (plist-get item :text))
+             (blob (plist-get item :blob)))
+         (cond
+          (text-content
+           (if (and mime (not (string-prefix-p "text/" mime)))
+               (format "[MIME: %s]\n%s" mime text-content)
+             text-content))
+          (blob
+           (format "[Binary: %s, base64 %d bytes]"
+                   (or mime "application/octet-stream")
+                   (length blob)))
+          (t (prin1-to-string item)))))
+     parts "\n---\n")))
+
 (defun mcp-hub-detail--display-resource (result uri)
   "Display RESULT from reading URI in a dedicated buffer.
 
@@ -627,27 +695,8 @@ array of content objects. Each content object has:
   - :mimeType — optional MIME type (e.g. \"text/plain\")
   - :text  — text content (for text resources)
   - :blob  — base64-encoded string (for binary resources)"
-  (let* ((buf (get-buffer-create (format "*Mcp Resource: %s*" uri)))
-         (contents (plist-get result :contents))
-         (parts (if (vectorp contents)
-                    contents
-                  (vector contents)))
-         (text (mapconcat
-                (lambda (item)
-                  (let ((mime (plist-get item :mimeType))
-                        (text-content (plist-get item :text))
-                        (blob (plist-get item :blob)))
-                    (cond
-                     (text-content
-                      (if (and mime (not (string-prefix-p "text/" mime)))
-                          (format "[MIME: %s]\n%s" mime text-content)
-                        text-content))
-                     (blob
-                      (format "[Binary: %s, base64 %d bytes]"
-                              (or mime "application/octet-stream")
-                              (length blob)))
-                     (t (prin1-to-string item)))))
-                parts "\n---\n")))
+  (let ((buf (get-buffer-create (format "*Mcp Resource: %s*" uri)))
+        (text (mcp-hub--prep-resource-text result)))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
