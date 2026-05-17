@@ -519,7 +519,11 @@ The message is sent differently based on connection type:
         ;; Save updated queue
         (process-put proc 'jsonrpc-mqueue queue)
 
-        ;; Dispatch messages in timer
+        ;; Dispatch messages in timer.  The dolist above accumulated queue
+        ;; via `push' (LIFO); reverse it here so dispatch follows arrival
+        ;; order — matters for notification streams where two messages
+        ;; arriving in one chunk would otherwise fire out of order.
+        (setq queue (nreverse queue))
         (cl-loop with time = (current-time)
                  for msg = (pop queue) while msg
                  do (let ((timer (timer-create)))
