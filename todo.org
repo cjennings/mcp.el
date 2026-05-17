@@ -1,0 +1,130 @@
+* mcp.el Open Work
+** TODO Tool required arguments are matched by position instead of by property name
+`mcp--parse-tool-args' treats the `required' schema list as if it is aligned with
+the order of `properties'. JSON Schema's `required' is a set of property names,
+not a positional list. If an optional property appears before a required property,
+the optional argument is marked required and the real required argument is marked
+optional.
+
+This matters because `mcp-make-text-tool' exposes the wrong tool contract to
+callers and can allow a call that omits a required MCP argument. The generated
+tool can then send malformed arguments to the server or force users to provide
+unnecessary optional values.
+
+Fix by checking each property name for membership in `required' rather than
+consuming `required' in parallel with `properties'. Normalize `required' to a list
+if the JSON parser returns a vector, then mark `:optional t' only when the
+property name is not present.
+
+Relevant code: `mcp.el' `mcp--parse-tool-args' and `mcp-make-text-tool'.
+
+** TODO Tool calls drop explicit nil/false argument values
+`mcp--generate-tool-call-args' uses `(if value value default)' and `when-let*' to
+decide whether an argument was supplied. In Emacs Lisp, `nil' is also the natural
+representation of false. A boolean argument intentionally supplied as false is
+therefore treated as missing, replaced by a default if one exists, or omitted
+entirely if no default exists.
+
+This matters for MCP tools with boolean parameters. Callers cannot reliably send
+false, so tool behavior can silently flip to a default or fail server-side schema
+validation.
+
+Fix by distinguishing "argument position was supplied" from "argument value is
+truthy". Iterate with an index or sentinel value for missing arguments, and only
+fall back to `:default' when the caller did not provide that position.
+
+Relevant code: `mcp.el' `mcp--generate-tool-call-args'.
+
+** TODO Start-all completion callback never runs for servers without tools
+`mcp-hub--start-server' invokes its `inited-callback' only from the
+`:tools-callback'. `mcp-hub-start-all-server' uses that callback to increment the
+started count and eventually call the user's completion callback. MCP servers are
+allowed to expose prompts/resources without tools, or no optional capabilities at
+all. For those servers, the start-all progress never reaches completion even
+after initialization succeeds.
+
+This matters for users who start servers programmatically and wait for the hub
+callback before enabling integrations. Their setup can hang indefinitely despite
+the server being connected.
+
+Fix by counting initialization completion independently from tool listing. The
+hub-level callback should probably run from `:initial-callback' after the server
+is connected, or from a single post-initialization continuation that runs whether
+tools/prompts/resources exist or not.
+
+Relevant code: `mcp-hub.el' `mcp-hub--start-server' and
+`mcp-hub-start-all-server'.
+
+** TODO Custom HTTP headers are omitted from the SSE GET request
+HTTP connections accept a `:headers' option and include those headers on JSON-RPC
+POST requests, but `mcp--connect-sse' builds the raw SSE GET request by hand and
+only includes Host, Accept, Authorization, Mcp-Session-Id, Cache-Control, and
+Connection. Any custom headers configured in `mcp-hub-servers' are silently
+dropped for the long-lived SSE channel.
+
+This matters for authenticated or proxied MCP servers that require headers other
+than bearer authorization, such as API keys, tenant IDs, or reverse-proxy routing
+headers. The POST side may work while the SSE stream fails, making the connection
+failure hard to diagnose.
+
+Fix by rendering `(mcp--headers conn)' into HTTP header lines in
+`mcp--connect-sse', using the same header shape accepted by `url-request-extra-headers'.
+Be careful to avoid duplicating headers that the function already sets
+explicitly.
+
+Relevant code: `mcp.el' `jsonrpc-connection-send' and `mcp--connect-sse'.
+
+** TODO HTTP URLs without a path create an invalid SSE request line
+`mcp--parse-http-url' preserves `url-filename' directly. For a URL like
+`http://example.com', that value is the empty string. `mcp--connect-sse' then
+sends `(format "GET %s HTTP/1.1\r\n" path)', producing `GET  HTTP/1.1' instead
+of `GET / HTTP/1.1'.
+
+This matters because a user may reasonably configure a server at the host root.
+The resulting raw HTTP request is malformed and the SSE connection can fail
+before MCP initialization has a chance to proceed.
+
+Fix by normalizing an empty path to "/" in `mcp--parse-http-url' or immediately
+before building HTTP request lines and URLs. Add a regression test for bare host
+HTTP and HTTPS URLs.
+
+Relevant code: `mcp.el' `mcp--parse-http-url' and `mcp--connect-sse'.
+
+** TODO Optional async resource callbacks are called unconditionally
+`mcp-async-read-resource' declares `callback' and `error-callback' as optional,
+but both lambdas call them with `funcall' unconditionally. Calling the function
+without either optional callback will turn a successful response or an error
+response into a `void-function nil' / invalid-function failure in the async
+handler.
+
+This matters because the public function signature invites callers to omit the
+callbacks. Instead of simply issuing a request or logging an error, the client can
+raise an unrelated callback error later, which is harder to associate with the
+original call.
+
+Fix by either making the callbacks required in the function contract or guarding
+each `funcall' with `(when callback ...)' / `(when error-callback ...)'. For
+consistency with `mcp--list-items', logging when no error callback is provided
+would be useful.
+
+Relevant code: `mcp.el' `mcp-async-read-resource'.
+
+** TODO HTTP response handling can crash when headers are missing or malformed
+The HTTP POST response callback parses headers and immediately calls
+`(substring response-code 0 1)'. If `mcp--parse-http-header' returns nil or a
+header block without `:response-code', `response-code' is nil and the callback
+signals a type error. `url-retrieve' can invoke callbacks for network failures or
+nonstandard responses, so this is a realistic robustness issue.
+
+This matters because transport failures should report a useful MCP connection
+error and clean up the connection state. A low-level substring error in the URL
+callback can leave users with a confusing backtrace and a half-initialized
+connection.
+
+Fix by checking that `headers-plist' and `response-code' are present before using
+them. On missing or malformed headers, call the connection's error callback,
+mark the connection as errored, and kill the response buffer.
+
+Relevant code: `mcp.el' `jsonrpc-connection-send' HTTP branch.
+
+* mcp.el Resolved
